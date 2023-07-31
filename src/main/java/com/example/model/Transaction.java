@@ -1,16 +1,13 @@
-package com.example;
+package com.example.model;
 
 import org.apache.beam.sdk.schemas.JavaFieldSchema;
 import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
 import org.joda.time.Instant;
 
-import com.google.gson.annotations.SerializedName;
-
 @DefaultSchema(JavaFieldSchema.class)
 public class Transaction {
-    @SerializedName("trx_id")
-    String transactionId;
-    @SerializedName("user_id")
-    String userId;
-    Instant timestamp;
+    public String trx_id;
+    public String user_id;
+    public Instant created_date;
+    public Instant process_date;
 }

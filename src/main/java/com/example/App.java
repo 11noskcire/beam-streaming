@@ -8,41 +8,33 @@
 
 package com.example;
 
+import java.util.List;
+
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.extensions.sql.SqlTransform;
+import org.apache.beam.sdk.io.csv.CsvIO;
 import org.apache.beam.sdk.io.kafka.KafkaIO;
+import org.apache.beam.sdk.io.kafka.KafkaRecord;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.StreamingOptions;
-import org.apache.beam.sdk.transforms.Create;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.GroupByKey;
-import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.WithKeys;
-import org.apache.beam.sdk.transforms.WithTimestamps;
-import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime;
-import org.apache.beam.sdk.transforms.windowing.AfterWatermark;
-import org.apache.beam.sdk.transforms.windowing.FixedWindows;
-import org.apache.beam.sdk.transforms.windowing.Sessions;
-import org.apache.beam.sdk.transforms.windowing.TimestampCombiner;
-import org.apache.beam.sdk.transforms.windowing.Window;
-import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.transforms.Filter;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.beam.sdk.values.TupleTagList;
-import org.apache.beam.sdk.values.TypeDescriptors;
+import org.apache.commons.csv.CSVFormat;
 import org.apache.kafka.common.serialization.StringDeserializer;
-import org.joda.time.Duration;
 import org.joda.time.Instant;
 
-import com.google.gson.JsonSyntaxException;
+import com.example.model.Transaction;
+import com.example.model.TransactionDetail;
+import com.example.utility.Gson;
 
 public class App {
-	static final TupleTag<Transaction> parsedMessages = new TupleTag<Transaction>() {
-	};
-	static final TupleTag<String> unparsedMessages = new TupleTag<String>() {
-	};
-
 	public interface Options extends StreamingOptions {
 		@Description("Input text to print.")
 		@Default.String("My input text")
@@ -53,113 +45,94 @@ public class App {
 
 	public static void main(String[] args) {
 		var options = PipelineOptionsFactory.fromArgs(args).withValidation().as(Options.class);
-		var pipeline = Pipeline.create(options);
-		var parseResults = pipeline
-				/**
-				 * DAG: read
-				 */
-				.apply(
-						"Read from kafka topic",
-						KafkaIO.<String, String>read()
-								.withBootstrapServers("kafka:9092")
-								.withTopic("source")
-								.withKeyDeserializer(StringDeserializer.class)
-								.withValueDeserializer(StringDeserializer.class)
-								.withoutMetadata())
-				// .apply(
-				// "Generate",
-				// Create.of(
-				// KV.<String, String>of(null,
-				// "{ \"trx_id\": \"1\", \"user_id\": \"2\", \"timestamp\":
-				// \"2023-07-31T01:12:30+07\", \"comment\": \"asdf\" }"),
-				// KV.<String, String>of(null,
-				// "{ \"trx_id\": \"1\", \"user_id\": \"2\", \"timestamp\":
-				// \"2023-07-31T01:12:30+07\", \"comment\": \"asdf\" }")))
-				/**
-				 * DAG: read ┬──> unparsed
-				 * ********* │
-				 * ********* └──> parsed
-				 */
-				.apply("Parse json", ParDo.of(new DoFn<KV<String, String>, Transaction>() {
-					@ProcessElement
-					public void processElement(ProcessContext context) {
-						var element = context.element();
-						MyGson gson = new MyGson();
-						String json = element.getValue();
-						try {
-							Transaction data = gson.fromJson(json, Transaction.class);
-							context.output(parsedMessages, data);
-						} catch (JsonSyntaxException e) {
-							context.output(unparsedMessages, json);
-						}
-					}
-				}).withOutputTags(parsedMessages, TupleTagList.of(unparsedMessages)));
+		Pipeline pipeline = Pipeline.create(options);
+		var kafkaRecords = pipeline.apply("Read from kafka",
+				KafkaIO.<String, String>read()
+						.withBootstrapServers("kafka:9092")
+						.withTopics(List.of("transactions", "transaction-details"))
+						.withKeyDeserializer(StringDeserializer.class)
+						.withValueDeserializer(StringDeserializer.class));
+		PCollection<Transaction> transactions = kafkaRecords
+				.apply("FilterTopic", Filter.by(kafkaRecord -> kafkaRecord.getTopic().equals("transactions")))
+				.apply("DeserializeJson", MapElements
+						.via(new SimpleFunction<KafkaRecord<String, String>, Transaction>() {
+							@Override
+							public Transaction apply(KafkaRecord<String, String> kafkaRecord) {
+								Gson gson = new Gson();
+								String json = kafkaRecord.getKV().getValue();
+								Transaction t = gson.fromJson(json, Transaction.class);
+								t.process_date = new Instant(kafkaRecord.getTimestamp());
+								return t;
+							}
+						}));
+		PCollection<TransactionDetail> transactionDetails = kafkaRecords
+				.apply("FilterTopic", Filter.by(kafkaRecord -> kafkaRecord.getTopic().equals("transaction-details")))
+				.apply("DeserializeJson", MapElements
+						.via(new SimpleFunction<KafkaRecord<String, String>, TransactionDetail>() {
+							@Override
+							public TransactionDetail apply(KafkaRecord<String, String> kafkaRecord) {
+								Gson gson = new Gson();
+								String json = kafkaRecord.getKV().getValue();
+								TransactionDetail td = gson.fromJson(json, TransactionDetail.class);
+								td.process_date = new Instant(kafkaRecord.getTimestamp());
+								return td;
+							}
+						}));
 
-		parseResults.get(unparsedMessages)
-				/**
-				 * DAG: read ┬──> unparsed ──> window
-				 * ********* │
-				 * ********* └──> parsed
-				 */
-				.apply(
-						"Fixed Window every 60s",
-						Window.into(FixedWindows.of(Duration.standardMinutes(1))))
-				/**
-				 * DAG: read ┬──> unparsed ──> window ──> write
-				 * ********* │
-				 * ********* └──> parsed
-				 */
-				.apply(
-						"Write unparsed data to file",
-						TextIO.write()
-								.to("unparsed/transaction")
-								.withWindowedWrites()
-								.withNumShards(1).withSuffix(".json"));
+		var transactionsWindowed = transactions
+				.apply(SqlTransform
+						.query("""
+									select
+										trx_id,
+										user_id,
+										created_date,
+										process_date
+									from PCOLLECTION
+									group by
+										trx_id,
+										user_id,
+										created_date,
+										process_date,
+										tumble(process_date, interval '1' minutes)
+								"""));
 
-		parseResults.get(parsedMessages)
-				/**
-				 * DAG: read ┬──> unparsed ──> fixedWindow ──> write
-				 * ********* │
-				 * ********* └──> parsed ──> userId+timestamp ──> sessionWindow
-				 */
-				.apply(WithTimestamps.of((Transaction t) -> t.timestamp)
-						.withAllowedTimestampSkew(Duration.millis(Long.MAX_VALUE)))
-				// .apply(ParDo.of(new DoFn<Transaction, Transaction>() {
-				// 	@ProcessElement
-				// 	public void processElement(ProcessContext context) {
-				// 		var element = context.element();
-				// 		var ts = context.timestamp();
-				// 		MyGson gson = new MyGson();
-				// 		System.out.println(gson.toJson(element));
-				// 		context.output(element);
-				// 	}
-				// }))
-				.apply(
-						"window",
-						Window.<Transaction>into(
-								Sessions.withGapDuration(Duration.standardSeconds(30)))
-								.withAllowedLateness(Duration.standardMinutes(1))
-								.withTimestampCombiner(TimestampCombiner.EARLIEST))
-				.apply(WithKeys.of((Transaction t) -> t.userId).withKeyType(TypeDescriptors.strings()))
-				.apply(GroupByKey.create())
-				.apply(ParDo.of(new DoFn<KV<String, Iterable<Transaction>>, KV<String, Integer>>() {
-					@ProcessElement
-					public void processElement(ProcessContext context) {
-						var element = context.element();
-						var x = context.timestamp();
-						String userId = element.getKey();
-						MyGson gson = new MyGson();
-						int count = 0;
-						Iterable<Transaction> transactions = element.getValue();
-						for (Transaction transaction : transactions) {
-							System.out.println("\n\n\n" + gson.toJson(transaction) + "\n\n\n");
-							count++;
-						}
-						System.out.println(userId + "\t" + count);
-						context.output(KV.of(userId, count));
-					}
-				}));
+		var transactionDetailsWindowed = transactionDetails
+				.apply(SqlTransform
+						.query("""
+									select
+										trx_id,
+										product_id,
+										qty,
+										price,
+										process_date
+									from PCOLLECTION
+									group by
+										trx_id,
+										product_id,
+										qty,
+										price,
+										process_date,
+										tumble(process_date, interval '1' minutes)
+								"""));
+
+		PCollectionTuple
+				.of(new TupleTag<>("trx"), transactionsWindowed)
+				.and(new TupleTag<>("trx_details"), transactionDetailsWindowed)
+				.apply(SqlTransform.query("""
+						select a.user_id, a.trx_id, sum(b.qty*b.price) as total
+						from trx a
+						left join trx_details b
+						on a.trx_id=b.trx_id
+						group by
+							a.user_id,
+							a.trx_id
+						"""))
+				.apply(CsvIO
+						.writeRows("csv/data", CSVFormat.DEFAULT)
+						.withWindowedWrites()
+						.withNumShards(1));
 
 		pipeline.run().waitUntilFinish();
 	}
+
 }
