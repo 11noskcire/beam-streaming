@@ -52,20 +52,20 @@ public class App {
         Pipeline pipeline = Pipeline.create(options);
         var kafkaRecords = pipeline.apply("Read from kafka",
                 KafkaIO.<String, String>read()
-                        .withBootstrapServers("kafka:9092")
-                        .withTopics(List.of("transactions", "transaction-details"))
+                        .withBootstrapServers(Config.KAFKA_BROKER)
+                        .withTopics(List.of(Config.TRANSACTION_TOPIC, Config.TRANSACTION_DETAIL_TOPIC))
                         .withKeyDeserializer(StringDeserializer.class)
                         .withValueDeserializer(StringDeserializer.class));
         var transactions = deserializeKafkaJson(
                 kafkaRecords,
-                "transactions",
+                Config.TRANSACTION_TOPIC,
                 Schema.builder()
                         .addStringField("trx_id")
                         .addStringField("user_id")
                         .addDateTimeField("created_date"));
         var transactionDetails = deserializeKafkaJson(
                 kafkaRecords,
-                "transaction-details",
+                Config.TRANSACTION_DETAIL_TOPIC,
                 Schema.builder()
                         .addStringField("trx_id")
                         .addStringField("product_id")
@@ -127,8 +127,8 @@ public class App {
                     }
                 }))
                 .apply("WriteToKafka", KafkaIO.<Void, String>write()
-                        .withBootstrapServers("kafka:9092")
-                        .withTopic("results")
+                        .withBootstrapServers(Config.KAFKA_BROKER)
+                        .withTopic(Config.RESULT_TOPIC)
                         .withValueSerializer(StringSerializer.class)
                         .values());
 

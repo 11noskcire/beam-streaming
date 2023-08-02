@@ -19,3 +19,5 @@ bin/
 project/*
 !project/plugins.sbt
 .scalafmt.conf
+
+.env
