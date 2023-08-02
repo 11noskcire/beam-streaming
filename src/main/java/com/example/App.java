@@ -8,12 +8,13 @@
 
 package com.example;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.sql.SqlTransform;
 import org.apache.beam.sdk.extensions.sql.impl.BeamSqlPipelineOptions;
-import org.apache.beam.sdk.io.csv.CsvIO;
 import org.apache.beam.sdk.io.kafka.KafkaIO;
 import org.apache.beam.sdk.io.kafka.KafkaRecord;
 import org.apache.beam.sdk.options.Default;
@@ -29,8 +30,9 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TupleTag;
-import org.apache.commons.csv.CSVFormat;
+import org.apache.beam.vendor.grpc.v1p54p0.com.google.gson.Gson;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.joda.time.Instant;
 
 public class App {
@@ -78,43 +80,57 @@ public class App {
                             SELECT *
                             FROM HOP(
                                 (SELECT * FROM TRX),
-                                DESCRIPTOR(EVENT_TIMESTAMP),
+                                DESCRIPTOR(event_timestamp),
                                 "INTERVAL 5 SECOND",
                                 "INTERVAL 1 MINUTE"
                             )
                         ), TRX_DETAILS_WINDOWED AS (
                             SELECT
                                 *,
-                                QTY*PRICE AS TOTAL
+                                qty*price AS total
                             FROM HOP(
                                 (SELECT * FROM TRX_DETAILS),
-                                DESCRIPTOR(EVENT_TIMESTAMP),
+                                DESCRIPTOR(event_timestamp),
                                 "INTERVAL 5 SECOND",
                                 "INTERVAL 1 MINUTE"
                             )
                         ), TRX_DETAILS_AGG AS (
                             SELECT
-                                TRX_ID,
-                                SUM(TOTAL) AS TOTAL
+                                trx_id,
+                                SUM(total) AS total
                             FROM TRX_DETAILS_WINDOWED
-                            GROUP BY TRX_ID
+                            GROUP BY trx_id
                         )
                         SELECT
-                            A.WINDOW_END as __TIME,
-                            A.USER_ID,
-                            COUNT(A.TRX_ID) AS VOLUME,
-                            SUM(B.TOTAL) AS TOTAL
+                            STRING(A.window_end) AS __time,
+                            A.user_id,
+                            COUNT(A.trx_id) AS volume,
+                            SUM(B.total) AS total
                         FROM TRX_WINDOWED A
                         LEFT JOIN TRX_DETAILS_AGG B
-                            ON A.TRX_ID=B.TRX_ID
+                            ON A.trx_id=B.trx_id
                         GROUP BY
-                            A.WINDOW_END,
-                            A.USER_ID
+                            A.window_end,
+                            A.user_id
                             """))
-                .apply(CsvIO
-                        .writeRows("data/csv/", CSVFormat.DEFAULT)
-                        .withWindowedWrites()
-                        .withNumShards(1));
+                .apply("RowToJson", MapElements.via(new SimpleFunction<Row, String>() {
+                    @Override
+                    public String apply(Row row) {
+                        Gson gson = new Gson();
+                        Map<String, Object> map = new HashMap<String, Object>();
+                        for (String fieldName : row.getSchema().getFieldNames()) {
+                            Object value = row.getValue(fieldName);
+                            map.put(fieldName, value);
+                        }
+                        String json = gson.toJson(map);
+                        return json;
+                    }
+                }))
+                .apply("WriteToKafka", KafkaIO.<Void, String>write()
+                        .withBootstrapServers("kafka:9092")
+                        .withTopic("results")
+                        .withValueSerializer(StringSerializer.class)
+                        .values());
 
         pipeline.run().waitUntilFinish();
     }
@@ -125,8 +141,8 @@ public class App {
             Schema.Builder schemaBuilder) {
         var schema = schemaBuilder.addDateTimeField("event_timestamp").build();
         return pCollection
-                .apply(Filter.by(k -> k.getTopic().equals(topic)))
-                .apply(MapElements.via(new SimpleFunction<KafkaRecord<?, String>, String>() {
+                .apply("FilterTopic", Filter.by(k -> k.getTopic().equals(topic)))
+                .apply("AddEventTimestamp", MapElements.via(new SimpleFunction<KafkaRecord<?, String>, String>() {
                     @Override
                     public String apply(KafkaRecord<?, String> k) {
                         String json = k.getKV().getValue().trim();
