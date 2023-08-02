@@ -10,7 +10,7 @@ import org.joda.time.Instant;
 public class TransactionDetail {
     public String trx_id;
     public String product_id;
-    public int qty;
+    public long qty;
     public BigDecimal price;
     public Instant process_date;
 }

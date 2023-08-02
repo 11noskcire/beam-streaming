@@ -12,6 +12,7 @@ import java.util.List;
 
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.sql.SqlTransform;
+import org.apache.beam.sdk.extensions.sql.impl.BeamSqlPipelineOptions;
 import org.apache.beam.sdk.io.csv.CsvIO;
 import org.apache.beam.sdk.io.kafka.KafkaIO;
 import org.apache.beam.sdk.io.kafka.KafkaRecord;
@@ -24,7 +25,6 @@ import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
-import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -45,6 +45,9 @@ public class App {
 
     public static void main(String[] args) {
         var options = PipelineOptionsFactory.fromArgs(args).withValidation().as(Options.class);
+        options
+                .as(BeamSqlPipelineOptions.class)
+                .setPlannerName("org.apache.beam.sdk.extensions.sql.zetasql.ZetaSQLQueryPlanner");
         Pipeline pipeline = Pipeline.create(options);
         var kafkaRecords = pipeline.apply("Read from kafka",
                 KafkaIO.<String, String>read()
@@ -79,56 +82,49 @@ public class App {
                             }
                         }));
 
-        var transactionsWindowed = transactions
-                .apply(SqlTransform
-                        .query("""
-                                	select
-                                		trx_id,
-                                		user_id,
-                                		created_date,
-                                		process_date
-                                	from PCOLLECTION
-                                	group by
-                                		trx_id,
-                                		user_id,
-                                		created_date,
-                                		process_date,
-                                		tumble(process_date, interval '1' minutes)
-                                """));
-
-        var transactionDetailsWindowed = transactionDetails
-                .apply(SqlTransform
-                        .query("""
-                                	select
-                                		trx_id,
-                                		product_id,
-                                		qty,
-                                		price,
-                                		process_date
-                                	from PCOLLECTION
-                                	group by
-                                		trx_id,
-                                		product_id,
-                                		qty,
-                                		price,
-                                		process_date,
-                                		tumble(process_date, interval '1' minutes)
-                                """));
-
         PCollectionTuple
-                .of(new TupleTag<>("trx"), transactionsWindowed)
-                .and(new TupleTag<>("trx_details"), transactionDetailsWindowed)
+                .of(new TupleTag<>("TRX"), transactions)
+                .and(new TupleTag<>("TRX_DETAILS"), transactionDetails)
                 .apply(SqlTransform.query("""
-                        select a.user_id, a.trx_id, sum(b.qty*b.price) as total
-                        from trx a
-                        left join trx_details b
-                        on a.trx_id=b.trx_id
-                        group by
-                        	a.user_id,
-                        	a.trx_id
-                        """))
+                        WITH TRX_WINDOWED AS (
+                            SELECT *
+                            FROM HOP(
+                                (SELECT * FROM TRX),
+                                DESCRIPTOR(PROCESS_DATE),
+                                "INTERVAL 5 SECOND",
+                                "INTERVAL 1 MINUTE"
+                            )
+                        ), TRX_DETAILS_WINDOWED AS (
+                            SELECT
+                                *,
+                                QTY*PRICE AS TOTAL
+                            FROM HOP(
+                                (SELECT * FROM TRX_DETAILS),
+                                DESCRIPTOR(PROCESS_DATE),
+                                "INTERVAL 5 SECOND",
+                                "INTERVAL 1 MINUTE"
+                            )
+                        ), TRX_DETAILS_AGG AS (
+                            SELECT
+                                TRX_ID,
+                                SUM(TOTAL) AS TOTAL
+                            FROM TRX_DETAILS_WINDOWED
+                            GROUP BY TRX_ID
+                        )
+                        SELECT
+                            A.WINDOW_END as __TIME,
+                            A.USER_ID,
+                            COUNT(A.TRX_ID) AS VOLUME,
+                            SUM(B.TOTAL) AS TOTAL
+                        FROM TRX_WINDOWED A
+                        LEFT JOIN TRX_DETAILS_AGG B
+                            ON A.TRX_ID=B.TRX_ID
+                        GROUP BY
+                            A.WINDOW_END,
+                            A.USER_ID
+                            """))
                 .apply(CsvIO
-                        .writeRows("csv/data", CSVFormat.DEFAULT)
+                        .writeRows("data/csv/", CSVFormat.DEFAULT)
                         .withWindowedWrites()
                         .withNumShards(1));
 
